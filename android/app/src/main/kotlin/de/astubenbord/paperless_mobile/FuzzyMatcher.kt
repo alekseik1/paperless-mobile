@@ -4,10 +4,14 @@ import kotlin.math.abs
 import kotlin.math.min
 
 object FuzzyMatcher {
-    private val separator = Regex("[^\\p{L}\\p{N}]+")
+    private const val MIN_VOCAB_WORD = 4
+    private val separator = Regex("[^\\p{L}\\p{M}\\p{N}]+")
 
     fun tokenize(normalizedText: String): List<String> =
         normalizedText.split(separator).filter { it.isNotEmpty() }
+
+    fun vocabWords(normalizedText: String): List<String> =
+        tokenize(normalizedText).filter { it.length >= MIN_VOCAB_WORD && it.any(Char::isLetter) }
 
     fun maxEdits(length: Int): Int = when {
         length < 4 -> 0
@@ -17,7 +21,7 @@ object FuzzyMatcher {
 
     fun candidates(token: String, vocab: Collection<String>, limit: Int = 10): List<String> {
         val max = maxEdits(token.length)
-        if (max == 0) return emptyList()
+        if (max == 0 || token.none(Char::isLetter)) return emptyList()
         return vocab.asSequence()
             .filter { it != token && abs(it.length - token.length) <= max }
             .map { it to distance(token, it, max) }
@@ -27,6 +31,17 @@ object FuzzyMatcher {
             .map { it.first }
             .toList()
     }
+
+    fun expandQuery(terms: List<String>, candidatesFor: (String) -> List<String>): String? {
+        val expansions = terms.map(candidatesFor)
+        if (expansions.all { it.isEmpty() }) return null
+        return terms.zip(expansions).joinToString(" ") { (term, candidates) ->
+            if (candidates.isEmpty()) term else (listOf(term) + candidates).joinToString(" OR ", "(", ")")
+        }
+    }
+
+    fun mergeHits(exact: List<SearchHit>, fuzzy: List<SearchHit>, limit: Int): List<SearchHit> =
+        (exact + fuzzy).distinctBy { it.id }.take(limit)
 
     // Optimal string alignment distance; returns max + 1 as soon as the result must exceed max.
     fun distance(a: String, b: String, max: Int): Int {

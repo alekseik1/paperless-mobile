@@ -1,6 +1,7 @@
 package de.astubenbord.paperless_mobile
 
 import android.content.Context
+import android.util.Log
 import androidx.appsearch.app.AppSearchBatchResult
 import androidx.appsearch.app.AppSearchResult
 import androidx.appsearch.app.AppSearchSchema
@@ -15,6 +16,7 @@ import androidx.appsearch.app.SetSchemaRequest
 import androidx.appsearch.localstorage.LocalStorage
 import java.io.File
 import java.security.MessageDigest
+import java.text.Normalizer
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
@@ -31,12 +33,14 @@ object SearchIndex {
     private const val PREFS = "search_index"
     private const val KEY_ACTIVE_USER = "active_user_id"
     private const val VOCAB_DIR = "search_vocab"
-    private const val MIN_VOCAB_WORD = 4
+    private const val TAG = "SearchIndex"
 
     val executor: ExecutorService = Executors.newSingleThreadExecutor()
 
     // Guarded by the object monitor; the sets are concurrent because search iterates them unlocked.
+    // Sets and files are only written on the executor, so loads, puts and invalidations never overlap.
     private val vocabularies = HashMap<String, MutableSet<String>>()
+    private val loading = HashSet<String>()
 
     @Volatile
     private var session: AppSearchSession? = null
@@ -76,7 +80,8 @@ object SearchIndex {
         .build()
 
     // LocalStorage ships without ICU data, so Icing does not case-fold non-ASCII text itself.
-    private fun normalize(text: String) = text.lowercase(Locale.ROOT).replace('ё', 'е')
+    internal fun normalize(text: String) =
+        Normalizer.normalize(text, Normalizer.Form.NFC).lowercase(Locale.ROOT).replace('ё', 'е')
 
     fun put(context: Context, userId: String, docs: List<IndexedDocument>) {
         if (docs.isEmpty()) return
@@ -90,7 +95,7 @@ object SearchIndex {
             builder.build()
         }).build()
         session(context).putAsync(request).get().throwOnFailure { false }
-        addWords(context, userId, docs.flatMap { vocabWords(normalize("${it.title.orEmpty()} ${it.content.orEmpty()}")) })
+        addWords(context, userId, docs.flatMap { FuzzyMatcher.vocabWords(normalize("${it.title.orEmpty()} ${it.content.orEmpty()}")) })
     }
 
     fun retainOnly(context: Context, userId: String, ids: List<Int>) {
@@ -100,6 +105,7 @@ object SearchIndex {
         session(context).removeAsync(
             RemoveByDocumentIdRequest.Builder(userId).addIds(stale).build()
         ).get().throwOnFailure { it.resultCode == AppSearchResult.RESULT_NOT_FOUND }
+        clearVocabulary(context, userId)
     }
 
     private fun <V> AppSearchBatchResult<String, V>.throwOnFailure(ignore: (AppSearchResult<V>) -> Boolean) {
@@ -121,14 +127,9 @@ object SearchIndex {
         if (terms.isEmpty()) return emptyList()
         val hits = runQuery(context, userId, terms.joinToString(" "), limit)
         if (hits.size >= limit) return hits
-        val vocab = vocabulary(context, userId)
-        val expansions = terms.map { FuzzyMatcher.candidates(it, vocab) }
-        if (expansions.all { it.isEmpty() }) return hits
-        val fuzzyQuery = terms.zip(expansions).joinToString(" ") { (term, candidates) ->
-            if (candidates.isEmpty()) term else (listOf(term) + candidates).joinToString(" OR ", "(", ")")
-        }
-        val seen = hits.map { it.id }.toSet()
-        return hits + runQuery(context, userId, fuzzyQuery, limit).filterNot { it.id in seen }.take(limit - hits.size)
+        val vocab = vocabulary(context, userId) ?: return hits
+        val fuzzyQuery = FuzzyMatcher.expandQuery(terms) { FuzzyMatcher.candidates(it, vocab) } ?: return hits
+        return FuzzyMatcher.mergeHits(hits, runQuery(context, userId, fuzzyQuery, limit + hits.size), limit)
     }
 
     private fun runQuery(context: Context, userId: String, query: String, limit: Int): List<SearchHit> {
@@ -177,19 +178,32 @@ object SearchIndex {
         return ids
     }
 
-    private fun vocabWords(normalizedText: String) =
-        FuzzyMatcher.tokenize(normalizedText).filter { it.length >= MIN_VOCAB_WORD }
-
     private fun vocabFile(context: Context, userId: String): File {
         val hash = MessageDigest.getInstance("SHA-256").digest(userId.toByteArray())
             .joinToString("") { "%02x".format(it) }
         return File(File(context.filesDir, VOCAB_DIR), "$hash.txt")
     }
 
-    // Loaded once per process; rebuilt from the index when the file is missing (index predates vocab).
+    // Null until the executor has loaded the file, or rebuilt it from the index when missing.
     @Synchronized
-    private fun vocabulary(context: Context, userId: String): MutableSet<String> {
+    private fun vocabulary(context: Context, userId: String): Set<String>? {
         vocabularies[userId]?.let { return it }
+        if (loading.add(userId)) {
+            executor.execute {
+                try {
+                    loadedVocabulary(context.applicationContext, userId)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Vocabulary load failed", e)
+                } finally {
+                    synchronized(this) { loading.remove(userId) }
+                }
+            }
+        }
+        return null
+    }
+
+    private fun loadedVocabulary(context: Context, userId: String): MutableSet<String> {
+        synchronized(this) { vocabularies[userId] }?.let { return it }
         val words: MutableSet<String> = ConcurrentHashMap.newKeySet()
         val file = vocabFile(context, userId)
         if (file.exists()) {
@@ -198,21 +212,23 @@ object SearchIndex {
             words.addAll(indexedWords(context, userId))
             if (words.isNotEmpty()) {
                 file.parentFile?.mkdirs()
-                file.writeText(words.joinToString("\n", postfix = "\n"))
+                val temp = File(file.parentFile, "${file.name}.tmp")
+                temp.writeText(words.joinToString("\n", postfix = "\n"))
+                check(temp.renameTo(file)) { "Cannot rename ${temp.name}" }
             }
         }
-        vocabularies[userId] = words
+        synchronized(this) { vocabularies[userId] = words }
         return words
     }
 
-    @Synchronized
     private fun addWords(context: Context, userId: String, candidates: List<String>) {
-        val words = vocabulary(context, userId)
-        val added = candidates.filter { words.add(it) }
+        val words = loadedVocabulary(context, userId)
+        val added = candidates.filterNot { it in words }.distinct()
         if (added.isEmpty()) return
         val file = vocabFile(context, userId)
         file.parentFile?.mkdirs()
         file.appendText(added.joinToString("\n", postfix = "\n"))
+        words.addAll(added)
     }
 
     @Synchronized
@@ -233,7 +249,7 @@ object SearchIndex {
                 if (page.isEmpty()) break
                 page.forEach { result ->
                     val doc = result.genericDocument
-                    words.addAll(vocabWords("${doc.getPropertyString("searchTitle").orEmpty()} ${doc.getPropertyString("content").orEmpty()}"))
+                    words.addAll(FuzzyMatcher.vocabWords("${doc.getPropertyString("searchTitle").orEmpty()} ${doc.getPropertyString("content").orEmpty()}"))
                 }
             }
         }
