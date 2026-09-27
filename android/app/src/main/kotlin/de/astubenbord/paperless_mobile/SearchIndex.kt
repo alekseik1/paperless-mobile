@@ -13,6 +13,7 @@ import androidx.appsearch.app.RemoveByDocumentIdRequest
 import androidx.appsearch.app.SearchSpec
 import androidx.appsearch.app.SetSchemaRequest
 import androidx.appsearch.localstorage.LocalStorage
+import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -22,7 +23,8 @@ data class SearchHit(val id: String, val title: String, val snippet: String)
 
 object SearchIndex {
     private const val DATABASE = "documents"
-    private const val SCHEMA_TYPE = "PaperlessDocument"
+    // Renamed on schema changes: force override drops the old type, count() hits 0 and Dart runs a full sync.
+    private const val SCHEMA_TYPE = "PaperlessDocumentV2"
     private const val PREFS = "search_index"
     private const val KEY_ACTIVE_USER = "active_user_id"
 
@@ -38,7 +40,7 @@ object SearchIndex {
         val created = LocalStorage.createSearchSessionAsync(searchContext).get()
         try {
             created.setSchemaAsync(
-                SetSchemaRequest.Builder().addSchemas(schema()).setForceOverride(false).build()
+                SetSchemaRequest.Builder().addSchemas(schema()).setForceOverride(true).build()
             ).get()
         } catch (e: Throwable) {
             created.close()
@@ -49,7 +51,13 @@ object SearchIndex {
     }
 
     private fun schema(): AppSearchSchema = AppSearchSchema.Builder(SCHEMA_TYPE)
-        .addProperty(textProperty("title"))
+        .addProperty(
+            StringPropertyConfig.Builder("title")
+                .setCardinality(PropertyConfig.CARDINALITY_OPTIONAL)
+                .setIndexingType(StringPropertyConfig.INDEXING_TYPE_NONE)
+                .build()
+        )
+        .addProperty(textProperty("searchTitle"))
         .addProperty(textProperty("content"))
         .build()
 
@@ -59,12 +67,18 @@ object SearchIndex {
         .setTokenizerType(StringPropertyConfig.TOKENIZER_TYPE_PLAIN)
         .build()
 
+    // LocalStorage ships without ICU data, so Icing does not case-fold non-ASCII text itself.
+    private fun normalize(text: String) = text.lowercase(Locale.ROOT).replace('ё', 'е')
+
     fun put(context: Context, userId: String, docs: List<IndexedDocument>) {
         if (docs.isEmpty()) return
         val request = PutDocumentsRequest.Builder().addGenericDocuments(docs.map { doc ->
             val builder = GenericDocument.Builder<GenericDocument.Builder<*>>(userId, doc.id.toString(), SCHEMA_TYPE)
-            doc.title?.let { builder.setPropertyString("title", it) }
-            doc.content?.let { builder.setPropertyString("content", it) }
+            doc.title?.let {
+                builder.setPropertyString("title", it)
+                builder.setPropertyString("searchTitle", normalize(it))
+            }
+            doc.content?.let { builder.setPropertyString("content", normalize(it)) }
             builder.build()
         }).build()
         session(context).putAsync(request).get().throwOnFailure { false }
@@ -93,7 +107,7 @@ object SearchIndex {
     fun count(context: Context, userId: String): Int = listIds(context, userId).size
 
     fun search(context: Context, userId: String, query: String, limit: Int): List<SearchHit> {
-        val terms = query.split(Regex("[^\\p{L}\\p{N}]+")).filter { it.isNotEmpty() }
+        val terms = normalize(query).split(Regex("[^\\p{L}\\p{N}]+")).filter { it.isNotEmpty() }
         if (terms.isEmpty()) return emptyList()
         val spec = namespaceSpec(userId)
             .setTermMatch(SearchSpec.TERM_MATCH_PREFIX)
