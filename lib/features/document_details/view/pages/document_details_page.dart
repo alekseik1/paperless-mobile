@@ -20,6 +20,7 @@ import 'package:paperless_mobile/features/document_details/view/widgets/document
 import 'package:paperless_mobile/features/documents/view/pages/document_view.dart';
 import 'package:paperless_mobile/features/documents/view/widgets/delete_document_confirmation_dialog.dart';
 import 'package:paperless_mobile/features/documents/view/widgets/document_preview.dart';
+import 'package:paperless_mobile/features/search_index/search_index_channel.dart';
 import 'package:paperless_mobile/features/similar_documents/view/similar_documents_view.dart';
 import 'package:paperless_mobile/generated/l10n/app_localizations.dart';
 import 'package:paperless_mobile/helpers/connectivity_aware_action_wrapper.dart';
@@ -58,6 +59,17 @@ class _DocumentDetailsPageState extends State<DocumentDetailsPage> {
   void initState() {
     super.initState();
     context.documentRepository.getMetaDataQuery(widget.id).fetch();
+    if (context.loggedInUserData.searchIndexingEnabled) {
+      context.documentRepository.getDocumentQuery(widget.id).fetch().then((s) {
+        final document = s.data;
+        if (document != null) {
+          const SearchIndexChannel().pushRecentDocument(
+            document.id,
+            document.title,
+          );
+        }
+      });
+    }
   }
 
   @override

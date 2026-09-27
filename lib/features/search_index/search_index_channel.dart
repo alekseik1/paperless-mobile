@@ -32,6 +32,14 @@ class SearchIndexChannel {
     await _channel.invokeMethod('clear', {'userId': userId});
   }
 
+  Future<void> pushRecentDocument(int id, String? title) async {
+    if (!Platform.isAndroid) return;
+    await _channel.invokeMethod('pushRecentDocument', {
+      'id': id,
+      'title': title,
+    });
+  }
+
   Future<int> count(String userId) async {
     if (!Platform.isAndroid) return 0;
     return await _channel.invokeMethod<int>('count', {'userId': userId}) ?? 0;

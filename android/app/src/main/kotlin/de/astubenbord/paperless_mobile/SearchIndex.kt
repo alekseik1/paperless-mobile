@@ -1,6 +1,11 @@
 package de.astubenbord.paperless_mobile
 
+import android.app.SearchManager
 import android.content.Context
+import android.content.Intent
+import androidx.core.content.pm.ShortcutInfoCompat
+import androidx.core.content.pm.ShortcutManagerCompat
+import androidx.core.graphics.drawable.IconCompat
 import androidx.appsearch.app.AppSearchBatchResult
 import androidx.appsearch.app.AppSearchResult
 import androidx.appsearch.app.AppSearchSchema
@@ -27,6 +32,7 @@ object SearchIndex {
     private const val SCHEMA_TYPE = "PaperlessDocumentV2"
     private const val PREFS = "search_index"
     private const val KEY_ACTIVE_USER = "active_user_id"
+    private const val SHORTCUT_PREFIX = "doc_"
 
     val executor: ExecutorService = Executors.newSingleThreadExecutor()
 
@@ -86,6 +92,10 @@ object SearchIndex {
 
     fun retainOnly(context: Context, userId: String, ids: List<Int>) {
         val keep = ids.map { it.toString() }.toSet()
+        val staleShortcuts = ShortcutManagerCompat.getDynamicShortcuts(context)
+            .map { it.id }
+            .filter { it.startsWith(SHORTCUT_PREFIX) && it.removePrefix(SHORTCUT_PREFIX) !in keep }
+        if (staleShortcuts.isNotEmpty()) ShortcutManagerCompat.removeDynamicShortcuts(context, staleShortcuts)
         val stale = listIds(context, userId).filterNot { it in keep }
         if (stale.isEmpty()) return
         session(context).removeAsync(
@@ -101,6 +111,7 @@ object SearchIndex {
     }
 
     fun clear(context: Context, userId: String) {
+        ShortcutManagerCompat.removeAllDynamicShortcuts(context)
         session(context).removeAsync("", namespaceSpec(userId).build()).get()
     }
 
@@ -125,7 +136,23 @@ object SearchIndex {
         }
     }
 
+    fun pushRecentDocument(context: Context, id: Int, title: String?) {
+        val intent = Intent(context, SearchTrampolineActivity::class.java)
+            .setAction(Intent.ACTION_VIEW)
+            .putExtra(SearchManager.EXTRA_DATA_KEY, id.toString())
+        val shortcut = ShortcutInfoCompat.Builder(context, "$SHORTCUT_PREFIX$id")
+            .setShortLabel(title?.takeIf { it.isNotBlank() } ?: "#$id")
+            .apply { if (!title.isNullOrBlank()) setLongLabel(title) }
+            .setIcon(IconCompat.createWithResource(context, R.mipmap.ic_launcher))
+            .setIntent(intent)
+            .build()
+        ShortcutManagerCompat.pushDynamicShortcut(context, shortcut)
+    }
+
     fun setActiveUser(context: Context, userId: String?) {
+        if (userId == null || userId != activeUser(context)) {
+            ShortcutManagerCompat.removeAllDynamicShortcuts(context)
+        }
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString(KEY_ACTIVE_USER, userId)
             .apply()

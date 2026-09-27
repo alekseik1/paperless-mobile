@@ -78,6 +78,9 @@ class _FakeChannel implements SearchIndexChannel {
   }
 
   @override
+  Future<void> pushRecentDocument(int id, String? title) async {}
+
+  @override
   Future<int> count(String userId) async => indexed;
 
   @override
