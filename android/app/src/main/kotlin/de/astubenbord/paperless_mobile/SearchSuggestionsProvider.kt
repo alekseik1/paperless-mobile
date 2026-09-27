@@ -28,7 +28,7 @@ class SearchSuggestionsProvider : ContentProvider() {
         }
         val userId = SearchIndex.activeUser(context)
         if (userId == null || query.isNullOrBlank()) return cursor
-        val limit = uri.getQueryParameter(SearchManager.SUGGEST_PARAMETER_LIMIT)?.toIntOrNull() ?: 10
+        val limit = uri.getQueryParameter(SearchManager.SUGGEST_PARAMETER_LIMIT)?.toIntOrNull()?.coerceIn(1, 50) ?: 10
         try {
             SearchIndex.search(context, userId, query, limit).forEachIndexed { index, hit ->
                 cursor.addRow(

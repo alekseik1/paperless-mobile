@@ -21,6 +21,21 @@ class SearchIndexState {
   });
 }
 
+Future<void> clearSearchIndex(
+  SearchIndexChannel channel,
+  LocalStore store,
+  String userId,
+) async {
+  await channel.clear(userId);
+  if (store.state.localUserData.containsKey(userId)) {
+    store.updateUserData(
+      userId,
+      (s) =>
+          s.copyWith(searchIndexLastModified: null, searchIndexLastSync: null),
+    );
+  }
+}
+
 class SearchIndexCubit extends Cubit<SearchIndexState> {
   static const _pageSize = 100;
 
@@ -35,6 +50,8 @@ class SearchIndexCubit extends Cubit<SearchIndexState> {
   bool get _enabled =>
       _store.state.localUserData[_userId]?.searchIndexingEnabled ?? false;
 
+  bool get _stopped => isClosed || !_enabled;
+
   Future<void> syncIfEnabled() async {
     if (!_enabled) {
       await _channel.setActiveUser(null);
@@ -45,7 +62,7 @@ class SearchIndexCubit extends Cubit<SearchIndexState> {
   }
 
   Future<void> sync() async {
-    if (state.syncing) return;
+    if (state.syncing || _stopped) return;
     emit(SearchIndexState(syncing: true, indexedCount: state.indexedCount));
     try {
       // An empty index (fresh install, cleared on logout) needs a full sync.
@@ -60,7 +77,7 @@ class SearchIndexCubit extends Cubit<SearchIndexState> {
           DocumentFilter(
             page: page,
             pageSize: _pageSize,
-            fields: const ['id', 'title', 'content', 'created', 'modified'],
+            fields: const ['id', 'title', 'content', 'modified'],
             sortField: SortField.modified,
             sortOrder: SortOrder.descending,
           ),
@@ -78,6 +95,7 @@ class SearchIndexCubit extends Cubit<SearchIndexState> {
                   .where((d) => d.modified?.isAfter(lastModified) ?? true)
                   .toList();
         if (changed.isNotEmpty) {
+          if (_stopped) return;
           await _channel.put(_userId, changed);
         }
         for (final d in changed) {
@@ -87,6 +105,7 @@ class SearchIndexCubit extends Cubit<SearchIndexState> {
           }
         }
         processed += result.results.length;
+        if (_stopped) return;
         emit(
           SearchIndexState(
             syncing: true,
@@ -99,6 +118,7 @@ class SearchIndexCubit extends Cubit<SearchIndexState> {
           break;
         }
       }
+      if (_stopped) return;
       _store.updateUserData(
         _userId,
         (s) => s.copyWith(
@@ -106,7 +126,9 @@ class SearchIndexCubit extends Cubit<SearchIndexState> {
           searchIndexLastSync: DateTime.now(),
         ),
       );
-      emit(SearchIndexState(indexedCount: await _channel.count(_userId)));
+      final indexedCount = await _channel.count(_userId);
+      if (_stopped) return;
+      emit(SearchIndexState(indexedCount: indexedCount));
     } catch (error, stackTrace) {
       logger.fe(
         'Search index sync failed.',
@@ -115,6 +137,7 @@ class SearchIndexCubit extends Cubit<SearchIndexState> {
         error: error,
         stackTrace: stackTrace,
       );
+      if (_stopped) return;
       emit(
         SearchIndexState(
           indexedCount: state.indexedCount,
@@ -140,14 +163,7 @@ class SearchIndexCubit extends Cubit<SearchIndexState> {
 
   Future<void> clearIndex() async {
     try {
-      await _channel.clear(_userId);
-      _store.updateUserData(
-        _userId,
-        (s) => s.copyWith(
-          searchIndexLastModified: null,
-          searchIndexLastSync: null,
-        ),
-      );
+      await clearSearchIndex(_channel, _store, _userId);
       emit(const SearchIndexState(indexedCount: 0));
     } catch (error, stackTrace) {
       logger.fe(

@@ -8,10 +8,8 @@ import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
-import java.util.concurrent.Executors
 
 class MainActivity : FlutterFragmentActivity() {
-    private val executor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     private var channel: MethodChannel? = null
     private var pendingDocumentId: Int? = null
@@ -28,7 +26,17 @@ class MainActivity : FlutterFragmentActivity() {
         val channel = channel
         if (channel != null) {
             pendingDocumentId = null
-            channel.invokeMethod("openDocument", mapOf("id" to id))
+            channel.invokeMethod("openDocument", mapOf("id" to id), object : MethodChannel.Result {
+                override fun success(result: Any?) {}
+
+                override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
+                    pendingDocumentId = id
+                }
+
+                override fun notImplemented() {
+                    pendingDocumentId = id
+                }
+            })
         } else {
             pendingDocumentId = id
         }
@@ -54,7 +62,7 @@ class MainActivity : FlutterFragmentActivity() {
             return
         }
         val context = applicationContext
-        executor.execute {
+        SearchIndex.executor.execute {
             try {
                 val value: Any? = when (call.method) {
                     "put" -> {
@@ -63,7 +71,6 @@ class MainActivity : FlutterFragmentActivity() {
                                 id = (it["id"] as Number).toInt(),
                                 title = it["title"] as String?,
                                 content = it["content"] as String?,
-                                created = (it["created"] as Number?)?.toLong(),
                             )
                         }
                         SearchIndex.put(context, call.userId(), docs)
@@ -89,7 +96,7 @@ class MainActivity : FlutterFragmentActivity() {
                     }
                 }
                 mainHandler.post { result.success(value) }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 mainHandler.post { result.error("search_index", e.message, null) }
             }
         }
@@ -97,8 +104,12 @@ class MainActivity : FlutterFragmentActivity() {
 
     private fun MethodCall.userId(): String = argument<String>("userId")!!
 
-    private fun documentId(intent: Intent): Int? =
-        if (intent.hasExtra(EXTRA_OPEN_DOCUMENT_ID)) intent.getIntExtra(EXTRA_OPEN_DOCUMENT_ID, 0) else null
+    private fun documentId(intent: Intent): Int? {
+        if (!intent.hasExtra(EXTRA_OPEN_DOCUMENT_ID)) return null
+        val id = intent.getIntExtra(EXTRA_OPEN_DOCUMENT_ID, 0)
+        intent.removeExtra(EXTRA_OPEN_DOCUMENT_ID)
+        return id.takeIf { (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) == 0 }
+    }
 
     companion object {
         const val EXTRA_OPEN_DOCUMENT_ID = "open_document_id"

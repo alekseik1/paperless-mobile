@@ -32,6 +32,8 @@ class _MemoryStorage implements Storage {
 class _FakeDocumentsApi implements PaperlessDocumentsApi {
   final List<PaginatedResultList<Document>> pages;
   Object? error;
+  int errorPage = 1;
+  void Function(int page)? onRequest;
   final requests = <(DocumentFilter?, bool)>[];
 
   _FakeDocumentsApi(this.pages);
@@ -42,7 +44,8 @@ class _FakeDocumentsApi implements PaperlessDocumentsApi {
     bool truncateContent = true,
   }) async {
     requests.add((options, truncateContent));
-    if (error != null) throw error!;
+    onRequest?.call(options!.page);
+    if (error != null && options!.page == errorPage) throw error!;
     return pages[options!.page - 1];
   }
 
@@ -88,7 +91,7 @@ class _FakeChannel implements SearchIndexChannel {
   void setOpenDocumentHandler(void Function(int documentId) onOpenDocument) {}
 }
 
-Document _doc(int id, DateTime modified) =>
+Document _doc(int id, DateTime? modified) =>
     Document(id: id, title: 'Doc $id', modified: modified);
 
 DateTime _day(int d) => DateTime.utc(2026, 1, d);
@@ -184,6 +187,124 @@ void main() {
     expect(userData.searchIndexingEnabled, isFalse);
     expect(userData.searchIndexLastModified, isNull);
     expect(cubit.state.indexedCount, 0);
+    await cubit.close();
+  });
+
+  test('empty index ignores stored lastModified and syncs fully', () async {
+    final api = _FakeDocumentsApi([
+      PaginatedResultList(
+        count: 2,
+        results: [_doc(3, _day(3)), _doc(2, _day(2))],
+      ),
+    ]);
+    final channel = _FakeChannel();
+    final store = _store(lastModified: _day(5));
+    final cubit = SearchIndexCubit(api, store, _userId, channel);
+
+    await cubit.sync();
+
+    expect(channel.puts, [
+      [3, 2],
+    ]);
+    expect(
+      store.state.localUserData[_userId]!.searchIndexLastModified,
+      _day(3),
+    );
+    await cubit.close();
+  });
+
+  test('failure on page 2 does not advance lastModified', () async {
+    final api =
+        _FakeDocumentsApi([
+            PaginatedResultList(
+              count: 4,
+              next: 'page2',
+              results: [_doc(5, _day(5)), _doc(4, _day(4))],
+            ),
+          ])
+          ..error = Exception('boom')
+          ..errorPage = 2;
+    final channel = _FakeChannel(indexed: 3);
+    final store = _store(lastModified: _day(1));
+    final cubit = SearchIndexCubit(api, store, _userId, channel);
+
+    await cubit.sync();
+
+    expect(channel.puts, [
+      [5, 4],
+    ]);
+    expect(
+      store.state.localUserData[_userId]!.searchIndexLastModified,
+      _day(1),
+    );
+    expect(cubit.state.lastError, contains('boom'));
+    await cubit.close();
+  });
+
+  test(
+    'modified equal to lastModified stops, null modified counts as changed',
+    () async {
+      final api = _FakeDocumentsApi([
+        PaginatedResultList(
+          count: 3,
+          next: 'page2',
+          results: [_doc(5, null), _doc(4, _day(3))],
+        ),
+      ]);
+      final channel = _FakeChannel(indexed: 3);
+      final cubit = SearchIndexCubit(
+        api,
+        _store(lastModified: _day(3)),
+        _userId,
+        channel,
+      );
+
+      await cubit.sync();
+
+      expect(api.requests.map((r) => r.$1!.page), [1]);
+      expect(channel.puts, [
+        [5],
+      ]);
+      await cubit.close();
+    },
+  );
+
+  test('syncIfEnabled when disabled deactivates without API calls', () async {
+    final api = _FakeDocumentsApi([]);
+    final channel = _FakeChannel();
+    final cubit = SearchIndexCubit(
+      api,
+      _store(enabled: false),
+      _userId,
+      channel,
+    );
+
+    await cubit.syncIfEnabled();
+
+    expect(channel.calls, ['setActiveUser(null)']);
+    expect(api.requests, isEmpty);
+    await cubit.close();
+  });
+
+  test('setEnabled(false) mid-sync stops further puts', () async {
+    final api = _FakeDocumentsApi([
+      PaginatedResultList(
+        count: 2,
+        next: 'page2',
+        results: [_doc(2, _day(2)), _doc(1, _day(1))],
+      ),
+    ]);
+    final channel = _FakeChannel();
+    final store = _store();
+    final cubit = SearchIndexCubit(api, store, _userId, channel);
+    api.onRequest = (_) => cubit.setEnabled(false);
+
+    await cubit.sync();
+    await pumpEventQueue();
+
+    expect(channel.puts, isEmpty);
+    expect(store.state.localUserData[_userId]!.searchIndexLastModified, isNull);
+    expect(cubit.state.syncing, isFalse);
     await cubit.close();
   });
 

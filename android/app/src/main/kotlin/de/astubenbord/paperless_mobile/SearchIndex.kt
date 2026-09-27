@@ -1,8 +1,9 @@
 package de.astubenbord.paperless_mobile
 
 import android.content.Context
+import androidx.appsearch.app.AppSearchBatchResult
+import androidx.appsearch.app.AppSearchResult
 import androidx.appsearch.app.AppSearchSchema
-import androidx.appsearch.app.AppSearchSchema.LongPropertyConfig
 import androidx.appsearch.app.AppSearchSchema.PropertyConfig
 import androidx.appsearch.app.AppSearchSchema.StringPropertyConfig
 import androidx.appsearch.app.AppSearchSession
@@ -12,8 +13,10 @@ import androidx.appsearch.app.RemoveByDocumentIdRequest
 import androidx.appsearch.app.SearchSpec
 import androidx.appsearch.app.SetSchemaRequest
 import androidx.appsearch.localstorage.LocalStorage
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
-data class IndexedDocument(val id: Int, val title: String?, val content: String?, val created: Long?)
+data class IndexedDocument(val id: Int, val title: String?, val content: String?)
 
 data class SearchHit(val id: String, val title: String, val snippet: String)
 
@@ -23,6 +26,8 @@ object SearchIndex {
     private const val PREFS = "search_index"
     private const val KEY_ACTIVE_USER = "active_user_id"
 
+    val executor: ExecutorService = Executors.newSingleThreadExecutor()
+
     @Volatile
     private var session: AppSearchSession? = null
 
@@ -31,9 +36,14 @@ object SearchIndex {
         session?.let { return it }
         val searchContext = LocalStorage.SearchContext.Builder(context.applicationContext, DATABASE).build()
         val created = LocalStorage.createSearchSessionAsync(searchContext).get()
-        created.setSchemaAsync(
-            SetSchemaRequest.Builder().addSchemas(schema()).setForceOverride(false).build()
-        ).get()
+        try {
+            created.setSchemaAsync(
+                SetSchemaRequest.Builder().addSchemas(schema()).setForceOverride(false).build()
+            ).get()
+        } catch (e: Throwable) {
+            created.close()
+            throw e
+        }
         session = created
         return created
     }
@@ -41,11 +51,6 @@ object SearchIndex {
     private fun schema(): AppSearchSchema = AppSearchSchema.Builder(SCHEMA_TYPE)
         .addProperty(textProperty("title"))
         .addProperty(textProperty("content"))
-        .addProperty(
-            LongPropertyConfig.Builder("created")
-                .setCardinality(PropertyConfig.CARDINALITY_OPTIONAL)
-                .build()
-        )
         .build()
 
     private fun textProperty(name: String) = StringPropertyConfig.Builder(name)
@@ -60,10 +65,9 @@ object SearchIndex {
             val builder = GenericDocument.Builder<GenericDocument.Builder<*>>(userId, doc.id.toString(), SCHEMA_TYPE)
             doc.title?.let { builder.setPropertyString("title", it) }
             doc.content?.let { builder.setPropertyString("content", it) }
-            doc.created?.let { builder.setPropertyLong("created", it) }
             builder.build()
         }).build()
-        session(context).putAsync(request).get()
+        session(context).putAsync(request).get().throwOnFailure { false }
     }
 
     fun retainOnly(context: Context, userId: String, ids: List<Int>) {
@@ -72,7 +76,14 @@ object SearchIndex {
         if (stale.isEmpty()) return
         session(context).removeAsync(
             RemoveByDocumentIdRequest.Builder(userId).addIds(stale).build()
-        ).get()
+        ).get().throwOnFailure { it.resultCode == AppSearchResult.RESULT_NOT_FOUND }
+    }
+
+    private fun <V> AppSearchBatchResult<String, V>.throwOnFailure(ignore: (AppSearchResult<V>) -> Boolean) {
+        val failures = failures.filterValues { !ignore(it) }
+        if (failures.isNotEmpty()) {
+            throw IllegalStateException(failures.entries.joinToString { "${it.key}: ${it.value.errorMessage}" })
+        }
     }
 
     fun clear(context: Context, userId: String) {
@@ -86,8 +97,9 @@ object SearchIndex {
         if (terms.isEmpty()) return emptyList()
         val spec = namespaceSpec(userId)
             .setTermMatch(SearchSpec.TERM_MATCH_PREFIX)
+            .setRankingStrategy(SearchSpec.RANKING_STRATEGY_RELEVANCE_SCORE)
             .setResultCountPerPage(limit)
-            .setSnippetCount(1)
+            .setSnippetCount(limit)
             .setSnippetCountPerProperty(1)
             .setMaxSnippetSize(120)
             .build()

@@ -17,12 +17,7 @@ class SearchIndexChannel {
       'userId': userId,
       'documents': [
         for (final d in documents)
-          {
-            'id': d.id,
-            'title': d.title,
-            'content': d.content,
-            'created': d.created?.millisecondsSinceEpoch,
-          },
+          {'id': d.id, 'title': d.title, 'content': d.content},
       ],
     });
   }
