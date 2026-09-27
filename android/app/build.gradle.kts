@@ -83,6 +83,7 @@ dependencies {
     implementation("androidx.appsearch:appsearch:1.1.0")
     implementation("androidx.appsearch:appsearch-local-storage:1.1.0")
     implementation("com.google.guava:guava:33.7.1-android")
+    testImplementation("junit:junit:4.13.2")
 }
 
 flutter {

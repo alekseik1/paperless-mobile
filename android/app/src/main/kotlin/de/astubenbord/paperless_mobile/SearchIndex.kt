@@ -13,7 +13,10 @@ import androidx.appsearch.app.RemoveByDocumentIdRequest
 import androidx.appsearch.app.SearchSpec
 import androidx.appsearch.app.SetSchemaRequest
 import androidx.appsearch.localstorage.LocalStorage
+import java.io.File
+import java.security.MessageDigest
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -27,8 +30,13 @@ object SearchIndex {
     private const val SCHEMA_TYPE = "PaperlessDocumentV2"
     private const val PREFS = "search_index"
     private const val KEY_ACTIVE_USER = "active_user_id"
+    private const val VOCAB_DIR = "search_vocab"
+    private const val MIN_VOCAB_WORD = 4
 
     val executor: ExecutorService = Executors.newSingleThreadExecutor()
+
+    // Guarded by the object monitor; the sets are concurrent because search iterates them unlocked.
+    private val vocabularies = HashMap<String, MutableSet<String>>()
 
     @Volatile
     private var session: AppSearchSession? = null
@@ -82,6 +90,7 @@ object SearchIndex {
             builder.build()
         }).build()
         session(context).putAsync(request).get().throwOnFailure { false }
+        addWords(context, userId, docs.flatMap { vocabWords(normalize("${it.title.orEmpty()} ${it.content.orEmpty()}")) })
     }
 
     fun retainOnly(context: Context, userId: String, ids: List<Int>) {
@@ -102,13 +111,27 @@ object SearchIndex {
 
     fun clear(context: Context, userId: String) {
         session(context).removeAsync("", namespaceSpec(userId).build()).get()
+        clearVocabulary(context, userId)
     }
 
     fun count(context: Context, userId: String): Int = listIds(context, userId).size
 
     fun search(context: Context, userId: String, query: String, limit: Int): List<SearchHit> {
-        val terms = normalize(query).split(Regex("[^\\p{L}\\p{N}]+")).filter { it.isNotEmpty() }
+        val terms = FuzzyMatcher.tokenize(normalize(query))
         if (terms.isEmpty()) return emptyList()
+        val hits = runQuery(context, userId, terms.joinToString(" "), limit)
+        if (hits.size >= limit) return hits
+        val vocab = vocabulary(context, userId)
+        val expansions = terms.map { FuzzyMatcher.candidates(it, vocab) }
+        if (expansions.all { it.isEmpty() }) return hits
+        val fuzzyQuery = terms.zip(expansions).joinToString(" ") { (term, candidates) ->
+            if (candidates.isEmpty()) term else (listOf(term) + candidates).joinToString(" OR ", "(", ")")
+        }
+        val seen = hits.map { it.id }.toSet()
+        return hits + runQuery(context, userId, fuzzyQuery, limit).filterNot { it.id in seen }.take(limit - hits.size)
+    }
+
+    private fun runQuery(context: Context, userId: String, query: String, limit: Int): List<SearchHit> {
         val spec = namespaceSpec(userId)
             .setTermMatch(SearchSpec.TERM_MATCH_PREFIX)
             .setRankingStrategy(SearchSpec.RANKING_STRATEGY_RELEVANCE_SCORE)
@@ -117,7 +140,7 @@ object SearchIndex {
             .setSnippetCountPerProperty(1)
             .setMaxSnippetSize(120)
             .build()
-        val page = session(context).search(terms.joinToString(" "), spec).use { it.nextPageAsync.get() }
+        val page = session(context).search(query, spec).use { it.nextPageAsync.get() }
         return page.take(limit).map { result ->
             val doc = result.genericDocument
             val snippet = result.matchInfos.firstOrNull { it.propertyPath == "content" }?.snippet
@@ -152,5 +175,68 @@ object SearchIndex {
             }
         }
         return ids
+    }
+
+    private fun vocabWords(normalizedText: String) =
+        FuzzyMatcher.tokenize(normalizedText).filter { it.length >= MIN_VOCAB_WORD }
+
+    private fun vocabFile(context: Context, userId: String): File {
+        val hash = MessageDigest.getInstance("SHA-256").digest(userId.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+        return File(File(context.filesDir, VOCAB_DIR), "$hash.txt")
+    }
+
+    // Loaded once per process; rebuilt from the index when the file is missing (index predates vocab).
+    @Synchronized
+    private fun vocabulary(context: Context, userId: String): MutableSet<String> {
+        vocabularies[userId]?.let { return it }
+        val words: MutableSet<String> = ConcurrentHashMap.newKeySet()
+        val file = vocabFile(context, userId)
+        if (file.exists()) {
+            file.forEachLine { if (it.isNotEmpty()) words.add(it) }
+        } else {
+            words.addAll(indexedWords(context, userId))
+            if (words.isNotEmpty()) {
+                file.parentFile?.mkdirs()
+                file.writeText(words.joinToString("\n", postfix = "\n"))
+            }
+        }
+        vocabularies[userId] = words
+        return words
+    }
+
+    @Synchronized
+    private fun addWords(context: Context, userId: String, candidates: List<String>) {
+        val words = vocabulary(context, userId)
+        val added = candidates.filter { words.add(it) }
+        if (added.isEmpty()) return
+        val file = vocabFile(context, userId)
+        file.parentFile?.mkdirs()
+        file.appendText(added.joinToString("\n", postfix = "\n"))
+    }
+
+    @Synchronized
+    private fun clearVocabulary(context: Context, userId: String) {
+        vocabularies.remove(userId)
+        vocabFile(context, userId).delete()
+    }
+
+    private fun indexedWords(context: Context, userId: String): Set<String> {
+        val spec = namespaceSpec(userId)
+            .addProjection(SCHEMA_TYPE, listOf("searchTitle", "content"))
+            .setResultCountPerPage(100)
+            .build()
+        val words = HashSet<String>()
+        session(context).search("", spec).use { results ->
+            while (true) {
+                val page = results.nextPageAsync.get()
+                if (page.isEmpty()) break
+                page.forEach { result ->
+                    val doc = result.genericDocument
+                    words.addAll(vocabWords("${doc.getPropertyString("searchTitle").orEmpty()} ${doc.getPropertyString("content").orEmpty()}"))
+                }
+            }
+        }
+        return words
     }
 }
