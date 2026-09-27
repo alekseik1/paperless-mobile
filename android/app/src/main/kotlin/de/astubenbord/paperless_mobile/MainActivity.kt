@@ -85,10 +85,6 @@ class MainActivity : FlutterFragmentActivity() {
                         SearchIndex.clear(context, call.userId())
                         null
                     }
-                    "pushRecentDocument" -> {
-                        SearchIndex.pushRecentDocument(context, call.argument<Int>("id")!!, call.argument<String>("title"))
-                        null
-                    }
                     "count" -> SearchIndex.count(context, call.userId())
                     "setActiveUser" -> {
                         SearchIndex.setActiveUser(context, call.argument<String>("userId"))
